@@ -1,4 +1,7 @@
+#![feature(once_cell)]
+
 use std::future::Future;
+use std::lazy::SyncLazy;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -8,17 +11,6 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
-    let (tx_futures, rx_futures) = mpsc::channel();
-    // 初始化Executor
-    let executor = Executor::new(rx_futures, tx_futures.clone());
-    thread::spawn(move || {
-        executor.run();
-    });
-    // 初始化Runtime
-    unsafe {
-        let rt_ptr: *mut Runtime = &RT as *const _ as *mut _;
-        (*rt_ptr).init(tx_futures);
-    }
     // let r = RT.block_on(async { 2 });
     // let r = RT.block_on(FakeIo::new(Duration::from_secs(2)));
     let r = RT.block_on(async {
@@ -28,7 +20,7 @@ fn main() {
     dbg!(r);
 }
 
-static RT: Runtime = Runtime::uninit();
+static RT: SyncLazy<Runtime> = SyncLazy::new(|| Runtime::new());
 
 struct FakeIo {
     val: Arc<Mutex<Option<i32>>>,
@@ -140,7 +132,7 @@ impl Executor {
 }
 
 struct Runtime {
-    tx_futures: Option<Sender<Task>>,
+    tx_futures: Sender<Task>,
     // 由于 Sender 没有实现 Sync，所以实现一个简单的 Spin
     lock: AtomicBool,
 }
@@ -148,15 +140,17 @@ struct Runtime {
 unsafe impl Sync for Runtime {}
 
 impl Runtime {
-    const fn uninit() -> Self {
+    fn new() -> Self {
+        let (tx_futures, rx_futures) = mpsc::channel();
+        // 初始化Executor
+        let executor = Executor::new(rx_futures, tx_futures.clone());
+        thread::spawn(move || {
+            executor.run();
+        });
         Self {
-            tx_futures: None,
+            tx_futures,
             lock: AtomicBool::new(false),
         }
-    }
-
-    fn init(&mut self, tx_futures: Sender<Task>) {
-        self.tx_futures = Some(tx_futures);
     }
 
     fn spawn<F, R>(&self, f: F) -> impl Future<Output = R>
@@ -179,11 +173,7 @@ impl Runtime {
         // 获取锁
         while self.lock.compare_and_swap(false, true, Ordering::SeqCst) {}
         // 调度任务
-        self.tx_futures
-            .as_ref()
-            .expect("Runtime未初始化")
-            .send(task)
-            .unwrap();
+        self.tx_futures.send(task).unwrap();
         // 释放锁
         self.lock.store(false, Ordering::SeqCst);
         waiter_f
@@ -207,11 +197,7 @@ impl Runtime {
         // 获取锁
         while self.lock.compare_and_swap(false, true, Ordering::SeqCst) {}
         // 调度任务
-        self.tx_futures
-            .as_ref()
-            .expect("Runtime未初始化")
-            .send(task)
-            .unwrap();
+        self.tx_futures.send(task).unwrap();
         // 释放锁
         self.lock.store(false, Ordering::SeqCst);
         rx.recv().unwrap()
